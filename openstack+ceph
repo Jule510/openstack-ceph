@@ -1,0 +1,157 @@
+参考资料：
+	http://docs.ceph.org.cn/rbd/rbd-openstack/
+	https://blog.51cto.com/limaomao/2163313
+1.	创建存储池
+ceph osd pool create volumes 128
+ceph osd pool create images 128
+ceph osd pool create vms 128
+2.	配置 OPENSTACK 的 CEPH 客户端
+	在openstack所有节点除ceph节点以外添加ceph配置文件
+ssh {your-openstack-server} sudo tee /etc/ceph/ceph.conf </etc/ceph/ceph.conf
+	安装 CEPH 客户端软件包
+	在controller节点和computer节点安装ceph
+yum install ceph ceph-radosgw
+	在controller节点上安装python-rbd
+yum install python-rbd
+
+	配置 CEPH 客户端认证
+	如果启用了cephx，分别为 Nova/Cinder 和 Glance 创建新用户。
+ceph auth get-or-create client.cinder mon 'allow r' osd 'allow class-read object_prefix rbd_children, allow rwx pool=volumes, allow rwx pool=vms, allow rx pool=images'
+
+ceph auth get-or-create client.glance mon 'allow r' osd 'allow class-read object_prefix rbd_children, allow rwx pool=images'		# images是自己创建的地址池
+
+（可选）ceph auth get-or-create client.cinder-backup mon 'allow r' osd 'allow class-read object_prefix rbd_children, allow rwx pool=backups'
+
+	把cinder的认证信息复制到controller节点和computer节点，把glance的认证信息复制到controller节点，并修改其权限。
+ceph auth get-or-create client.glance | ssh {your-glance-api-server} sudo tee /etc/ceph/ceph.client.glance.keyring
+#{your-glance-api-server}为controller节点
+
+ssh {your-glance-api-server} sudo chown glance:glance /etc/ceph/ceph.client.glance.keyring
+#修改权限，若是没有glance用户和组，重新创建一个
+
+ceph auth get-or-create client.cinder | ssh {your-volume-server} sudo tee /etc/ceph/ceph.client.cinder.keyring
+#{your-volume-server}包括controller节点和computer节点
+
+ssh {your-cinder-volume-server} sudo chown cinder:cinder /etc/ceph/ceph.client.cinder.keyring
+#修改权限，若是没有cinder用户和组，重新创建一个
+
+（可选）ceph auth get-or-create client.cinder-backup | ssh {your-cinder-backup-server} sudo tee /etc/ceph/ceph.client.cinder-backup.keyring
+
+（可选）ssh {your-cinder-backup-server} sudo chown cinder:cinder /etc/ceph/ceph.client.cinder-backup.keyring
+
+	把 client.cinder 用户的密钥存进 libvirt。 libvirt 进程从 Cinder 挂载块设备时要用它访问集群。在运行computer 的节点上创建一个密钥的临时副本：
+ceph auth get-or-create client.cinder | ssh {your-nova-compute-server} sudo tee /etc/ceph/ceph.client.cinder.keyring
+#{your-nova-compute-server}是computer节点
+
+ceph auth get-key client.cinder | ssh {your-compute-node} tee client.cinder.key
+#创建密钥的临时副本
+
+	然后，在计算节点上把密钥加进 libvirt 、然后删除临时副本：
+uuidgen
+457eb676-33da-42ec-9a8c-9293d545c337
+	#电脑显示出来的ID，uuidgen命令每次使用都会有不同的ID
+
+cat > secret.xml <<EOF
+<secret ephemeral='no' private='no'>
+  <uuid>457eb676-33da-42ec-9a8c-9293d545c337</uuid>
+  <usage type='ceph'>
+        <name>client.cinder secret</name>
+  </usage>
+</secret>
+EOF
+	#457eb676-33da-...要与之前的uuidgen出来的id一样
+	sudo virsh secret-define --file secret.xml
+Secret 457eb676-33da-42ec-9a8c-9293d545c337 created
+
+sudo virsh secret-set-value --secret 457eb676-33da-42ec-9a8c-9293d545c337 --base64 $(cat client.cinder.key) && rm client.cinder.key secret.xml
+#使用virth secret-list 显示密钥是否有加入成功
+
+	保留密钥的 uuid ，稍后要用。
+
+3.	配置 OPENSTACK 使用 CEPH
+	配置glance
+	编辑 /etc/glance/glance-api.conf 并把下列内容加到 [glance_store] 段下：
+[DEFAULT]
+...
+default_store = rbd
+...
+[glance_store]
+stores = rbd
+rbd_store_pool = images
+rbd_store_user = glance
+rbd_store_ceph_conf = /etc/ceph/ceph.conf
+rbd_store_chunk_size = 8
+
+	允许使用 image 的写时复制克隆，再添加下列内容到 [DEFAULT] 段下：
+show_image_direct_url = True
+
+	禁用 Glance 缓存管理，以免 image 被缓存到 /var/lib/glance/image-cache/ 下，假设你的配置文件里有 flavor = keystone+cachemanagement ：
+[paste_deploy]
+flavor = keystone
+
+	配置cinder
+	OpenStack 需要一个驱动和 Ceph 块设备交互。还得指定块设备所在的存储池名。编辑 OpenStack 节点（这里是ceph节点+controller节点）上的 /etc/cinder/cinder.conf ，添加：
+[DEFAULT]
+...
+enabled_backends = ceph
+...
+[ceph]
+volume_driver = cinder.volume.drivers.rbd.RBDDriver
+rbd_pool = volumes
+rbd_ceph_conf = /etc/ceph/ceph.conf
+rbd_flatten_volume_from_snapshot = false
+rbd_max_clone_depth = 5
+rbd_store_chunk_size = 4
+rados_connect_timeout = -1
+glance_api_version = 2
+
+	如果你使用了 cephx 认证，还需要配置用户及其密钥（前述文档中存进了 libvirt ）的 uuid ：
+[ceph]
+...
+rbd_user = cinder
+rbd_secret_uuid = 457eb676-33da-42ec-9a8c-9293d545c337
+#457eb676-33da-42ec-9a8c-9293d545c337是之前uuidgen出来的id
+
+	配置 NOVA
+	编辑所有计算节点上的 Ceph 配置文件：添加以下片段
+[client]
+        rbd cache = true
+        rbd cache writethrough until flush = true
+        admin socket = /var/run/ceph/guests/$cluster-$type.$id.$pid.$cctid.asok
+        log file = /var/log/qemu/qemu-guest-$pid.log
+        rbd concurrent management ops = 20
+
+	调整这些路径的权限：
+mkdir -p /var/run/ceph/guests/ /var/log/qemu/
+chown qemu:libvirtd /var/run/ceph/guests /var/log/qemu/
+
+	在 Juno 版中， Ceph 块设备移到了 [libvirt] 段下。编辑所有计算节点上的 /etc/nova/nova.conf 文件，在 [libvirt] 段下添加：
+[libvirt]
+images_type = rbd
+images_rbd_pool = vms
+images_rbd_ceph_conf = /etc/ceph/ceph.conf
+rbd_user = cinder
+rbd_secret_uuid = 457eb676-33da-42ec-9a8c-9293d545c337
+disk_cachemodes="network=writeback"
+
+inject_password = false
+inject_key = false
+inject_partition = -2
+
+hw_disk_discard = unmap
+		
+		为确保热迁移能顺利进行，要使用如下标志：
+live_migration_flag="VIR_MIGRATE_UNDEFINE_SOURCE,VIR_MIGRATE_PEER2PEER,VIR_MIGRATE_LIVE,VIR_MIGRATE_PERSIST_DEST,VIR_MIGRATE_TUNNELLED"
+
+4.	重启 OPENSTACK
+sudo service openstack-glance-api restart
+sudo service openstack-nova-compute restart
+sudo service openstack-cinder-volume restart
+(可选)sudo service openstack-cinder-backup restart
+
+5.	验证
+创建镜像
+openstack image create "cirros-qcow2" --file ~/cirros-0.3.5-x86_64-disk.img --disk-format qcow2 --container-format bare –public
+
+显示镜像
+rbd ls images
